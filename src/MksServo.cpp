@@ -1,12 +1,18 @@
 // MksServo.cpp - Implementierung, siehe MksServo.h
 #include "MksServo.h"
 
+#include <errno.h>
+
 namespace mks {
 
 namespace {
 
 uint16_t hiWord(uint32_t v) { return static_cast<uint16_t>(v >> 16); }
 uint16_t loWord(uint32_t v) { return static_cast<uint16_t>(v & 0xFFFF); }
+uint8_t hiByte(uint16_t v) { return static_cast<uint8_t>(v >> 8); }
+uint8_t loByte(uint16_t v) { return static_cast<uint8_t>(v & 0xFF); }
+
+constexpr const char* REJECTED_TEXT = "vom Servo abgelehnt";
 uint16_t clampRpm(uint32_t rpm) { return rpm > MAX_RPM ? MAX_RPM : static_cast<uint16_t>(rpm); }
 
 // Modbus-CRC16 (Polynom 0xA001, Startwert 0xFFFF), Low-Byte wird zuerst gesendet
@@ -48,45 +54,54 @@ const char* workModeText(uint8_t mode) {
 // Rohzugriff
 // ---------------------------------------------------------------------------
 
-bool MksServo::writeRegister(uint16_t address, uint16_t value) {
-  // Funktionscode 0x06 (Write Single Register)
-  if (_bus.holdingRegisterWrite(_id, address, value)) {
-    _lastError = "";
-    return true;
-  }
-  const char* err = _bus.lastError();
-  _lastError = err ? err : "Schreiben fehlgeschlagen";
+bool MksServo::succeed() {
+  _lastError = "";
+  _rejected = false;
+  return true;
+}
+
+bool MksServo::fail(const char* message, bool rejected) {
+  _lastError = message;
+  _rejected = rejected;
   return false;
+}
+
+bool MksServo::failFromBus(const char* fallback) {
+  const char* err = _bus.lastError();
+  return fail(err ? err : fallback);
+}
+
+bool MksServo::writeRegister(uint16_t address, uint16_t value) {
+  // Funktionscode 0x06 (Write Single Register) - bewusst als Rohtelegramm:
+  // ArduinoModbus prueft das Echo nicht und wuerde eine Ablehnung des Servos
+  // (Antwort mit Wert 0xFFFF) als Erfolg melden.
+  const uint8_t pdu[] = {_id, 0x06, hiByte(address), loByte(address), hiByte(value), loByte(value)};
+  return rawRequest(pdu, sizeof(pdu), 8);
 }
 
 bool MksServo::writeRegisters(uint16_t address, const uint16_t* values, uint8_t count) {
   // Funktionscode 0x10 (Write Multiple Registers)
+  errno = 0;
   if (_bus.beginTransmission(_id, HOLDING_REGISTERS, address, count)) {
     for (uint8_t i = 0; i < count; ++i) {
       _bus.write(values[i]);
     }
-    if (_bus.endTransmission()) {
-      _lastError = "";
-      return true;
-    }
+    if (_bus.endTransmission()) return succeed();
   }
-  const char* err = _bus.lastError();
-  _lastError = err ? err : "Schreiben fehlgeschlagen";
-  return false;
+  // Ablehnung: der Servo meldet "0 Register geschrieben" -> libmodbus: EMBBADDATA
+  if (errno == EMBBADDATA) return fail(REJECTED_TEXT, true);
+  return failFromBus("Schreiben fehlgeschlagen");
 }
 
 bool MksServo::readInputRegisters(uint16_t address, uint16_t* out, uint8_t count) {
   // Funktionscode 0x04 (Read Input Registers)
   if (_bus.requestFrom(_id, INPUT_REGISTERS, address, count) != count) {
-    const char* err = _bus.lastError();
-    _lastError = err ? err : "Lesen fehlgeschlagen";
-    return false;
+    return failFromBus("Lesen fehlgeschlagen");
   }
   for (uint8_t i = 0; i < count; ++i) {
     out[i] = static_cast<uint16_t>(_bus.read());
   }
-  _lastError = "";
-  return true;
+  return succeed();
 }
 
 bool MksServo::readU16(uint16_t address, uint16_t& value) {
@@ -99,8 +114,7 @@ bool MksServo::rawRequest(const uint8_t* pdu, size_t pduLen, size_t respLen) {
   uint8_t frame[32];
   uint8_t resp[16];
   if (pduLen + 2 > sizeof(frame) || respLen > sizeof(resp) || respLen < 8) {
-    _lastError = "Rohtelegramm zu lang";
-    return false;
+    return fail("Rohtelegramm zu lang");
   }
   memcpy(frame, pdu, pduLen);
   const uint16_t crc = crc16(frame, pduLen);
@@ -123,24 +137,25 @@ bool MksServo::rawRequest(const uint8_t* pdu, size_t pduLen, size_t respLen) {
     }
   }
 
-  if (n < 5) {
-    _lastError = "Connection timed out";
-    return false;
-  }
+  if (n < 5) return fail("Connection timed out");
   if (crc16(resp, n - 2) != static_cast<uint16_t>(resp[n - 2] | (resp[n - 1] << 8))) {
-    _lastError = "Invalid CRC";
-    return false;
+    return fail("Invalid CRC");
   }
   if (resp[1] & 0x80) {
-    _lastError = resp[2] == 0x02 ? "Illegal data address" : "Modbus-Exception";
-    return false;
+    switch (resp[2]) {
+      case 0x02: return fail("Illegal data address");
+      case 0x03: return fail("Illegal data value");
+      default:   return fail("Modbus-Exception");
+    }
   }
-  if (n != respLen || memcmp(resp, frame, 6) != 0) {
-    _lastError = "Unerwartete Antwort";
-    return false;
-  }
-  _lastError = "";
-  return true;
+  if (n != respLen || memcmp(resp, frame, 4) != 0) return fail("Unerwartete Antwort");
+  if (memcmp(resp + 4, frame + 4, 2) == 0) return succeed();
+
+  // Ablehnung laut Handbuch V1.0.9: FC 0x06 antwortet mit Wert 0xFFFF,
+  // FC 0x10 mit Registeranzahl 0.
+  const bool rejected = (frame[1] == 0x06 && resp[4] == 0xFF && resp[5] == 0xFF) ||
+                        (frame[1] == 0x10 && resp[4] == 0x00 && resp[5] == 0x00);
+  return fail(rejected ? REJECTED_TEXT : "Unerwartete Antwort", rejected);
 }
 
 // ---------------------------------------------------------------------------

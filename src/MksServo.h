@@ -150,8 +150,14 @@ class MksServo {
   bool writeRegisters(uint16_t address, const uint16_t* values, uint8_t count);
 
   const char* lastError() const { return _lastError; }
+  // true, wenn der Servo geantwortet, den Befehl aber abgelehnt hat (z. B. "dis"
+  // oder "cur" waehrend der Motor laeuft) - im Gegensatz zu einem Bus-Fehler.
+  bool lastWasRejected() const { return _rejected; }
 
  private:
+  bool succeed();
+  bool fail(const char* message, bool rejected = false);
+  bool failFromBus(const char* fallback);
   bool readU16(uint16_t address, uint16_t& value);
   bool moveAccSpeedPos(uint16_t reg, Motion motion, int32_t pos, uint16_t rpm, uint8_t acc);
   // Sendet pdu (ohne CRC) direkt ueber RS485 und erwartet eine Antwort von
@@ -163,6 +169,7 @@ class MksServo {
   uint8_t _id;
   Motion _lastMotion = Motion::None;
   const char* _lastError = "";
+  bool _rejected = false;
 };
 
 }  // namespace mks
